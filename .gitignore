@@ -1,0 +1,40 @@
+# Python virtual environments
+venv/
+.venv/
+ocr-venv/
+env/
+
+# Node modules
+node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+
+# OS files
+.DS_Store
+
+# Logs
+*.log
+
+# Sensitive/env
+.env
+.env.*
+
+# Large/derivative artifacts
+uploads/
+models/
+*.dat
+*.bz2
+
+# VSCode
+.vscode/
+
+# IDE
+.idea/
