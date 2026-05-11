@@ -10,7 +10,9 @@ UPLOAD_DIR = os.path.join(MODULE_DIR, 'uploads')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Image processing
-MIN_CONTOUR_AREA_RATIO = 0.2
+# Card contour can be relatively small in mobile captures (card not filling frame),
+# so keep this low to avoid falling back to full-image cropping.
+MIN_CONTOUR_AREA_RATIO = 0.05
 CARD_RATIO_MIN = 1.35
 CARD_RATIO_MAX = 1.9
 MIN_DIMENSION = 50
@@ -25,6 +27,13 @@ KTP_PHOTO_X_START = 0.73
 KTP_PHOTO_Y_START = 0.24
 KTP_PHOTO_X_END = 0.94
 KTP_PHOTO_Y_END = 0.76
+
+# KTP Signature extraction (card-relative, same system as KTP photo crop)
+# Adjust these 4 values to reposition the signature crop on the warped card.
+KTP_SIGNATURE_X_START = 0.73
+KTP_SIGNATURE_Y_START = 0.78
+KTP_SIGNATURE_X_END   = 0.94
+KTP_SIGNATURE_Y_END   = 0.96
 
 # Flask
 FLASK_HOST = '0.0.0.0'

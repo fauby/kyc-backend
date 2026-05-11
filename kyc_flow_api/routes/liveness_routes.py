@@ -1,146 +1,109 @@
-"""Liveness detection and face matching routes."""
+"""Liveness detection and face matching routes (FastAPI)."""
 
-from flask import request, jsonify
+import os
+import tempfile
+from typing import List, Optional
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
+
 from ..services import LivenessService, MatchingService
+
+router = APIRouter()
 
 liveness_service = LivenessService()
 matching_service = MatchingService()
 
 
-def register_liveness_routes(app):
-    """Register liveness and matching routes to Flask app."""
-    
-    @app.route('/liveness/detect', methods=['POST'])
-    def detect_liveness():
-        """
-        Detect liveness from frame sequence.
-        
-        Request (JSON):
-            - frames: list of base64-encoded frames
-            - required_poses (optional): list of poses to detect
-        
-        Response:
-            - is_live: bool indicating liveness
-            - poses_detected: list of detected poses
-            - scores: confidence scores per pose
-            - confidence: overall confidence 0-100
-            - diagnostics: frame analysis details
-        """
+@router.post("/liveness")
+async def liveness_video(
+    video: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+):
+    if not video:
+        raise HTTPException(status_code=400, detail={"error": "No video file provided"})
+
+    suffix = os.path.splitext(video.filename or "liveness.mp4")[1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await video.read()
+        if not content:
+            raise HTTPException(status_code=400, detail={"error": "Empty video"})
+        tmp.write(content)
+        tmp.close()
+
+        result = liveness_service.detect_liveness_from_video(tmp.name)
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result)
+        return result
+    finally:
         try:
-            data = request.get_json()
-            frames_b64 = data.get('frames', [])
-            required_poses = data.get('required_poses')
-            
-            if not frames_b64:
-                return jsonify({'error': 'No frames provided'}), 400
-            
-            print('[liveness_routes] Detecting liveness from frames')
-            result = liveness_service.detect_liveness(frames_b64, required_poses)
-            
-            if 'error' in result:
-                return jsonify(result), 400
-            
-            return jsonify(result)
-        
-        except Exception as e:
-            print(f'[liveness_routes] Error: {e}')
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/liveness/best-frame', methods=['POST'])
-    def get_best_frame():
-        """
-        Find best (most neutral) frame from liveness sequence.
-        
-        Request (JSON):
-            - frames: list of base64-encoded frames
-        
-        Response:
-            - best_frame: base64-encoded best frame
-            - head_pose: {yaw, pitch, roll} angles in degrees
-        """
-        try:
-            data = request.get_json()
-            frames_b64 = data.get('frames', [])
-            
-            if not frames_b64:
-                return jsonify({'error': 'No frames provided'}), 400
-            
-            print('[liveness_routes] Finding best frame')
-            result = liveness_service.get_best_frame(frames_b64)
-            
-            if 'error' in result:
-                return jsonify(result), 400
-            
-            return jsonify(result)
-        
-        except Exception as e:
-            print(f'[liveness_routes] Error: {e}')
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/match/faces', methods=['POST'])
-    def match_ktp_liveness():
-        """
-        Match KTP face with liveness face.
-        
-        Request (JSON or multipart):
-            - ktp_face_image: base64 KTP face (preferred) OR
-            - ktp_photo_crop_path: path to KTP photo on server
-            - liveness_image: base64 single liveness frame OR
-            - liveness_frames: list of base64 liveness frames
-        
-        Response:
-            - match_score: 0-100 similarity
-            - is_match: bool (True if score >= 50)
-            - ktp_face_base64: extracted KTP face
-            - liveness_face_base64: extracted liveness face
-            - distance: euclidean distance between descriptors
-            - best_frame_idx: index of best matching frame (if multiple frames provided)
-        """
-        try:
-            # Parse request (supports both JSON and multipart)
-            if request.is_json:
-                data = request.get_json()
-                ktp_b64 = data.get('ktp_face_image')
-                liveness_b64 = data.get('liveness_image')
-                liveness_frames_b64 = data.get('liveness_frames')
-                ktp_photo_path = data.get('ktp_photo_crop_path')
-            else:
-                data = request.form
-                ktp_b64 = data.get('ktp_face_image')
-                liveness_b64 = data.get('liveness_image')
-                liveness_frames_b64 = request.form.getlist('liveness_frames')
-                ktp_photo_path = data.get('ktp_photo_crop_path')
-            
-            print('[match_routes] Matching faces')
-            
-            # Load KTP image
-            ktp_frame = matching_service.load_ktp_image(ktp_b64, ktp_photo_path)
-            if ktp_frame is None:
-                return jsonify({
-                    'error': 'KTP photo crop required. Please rescan the KTP.'
-                }), 400
-            
-            # Match single liveness frame
-            if liveness_b64:
-                liveness_frame = matching_service.decode_image(liveness_b64)
-                if liveness_frame is None:
-                    return jsonify({'error': 'Could not decode liveness image'}), 400
-                
-                result = matching_service.match_faces_single(ktp_frame, liveness_frame)
-            
-            # Match against sequence of liveness frames
-            elif liveness_frames_b64:
-                liveness_frames = matching_service.decode_frames(liveness_frames_b64)
-                if not liveness_frames:
-                    return jsonify({'error': 'Could not decode liveness frames'}), 400
-                
-                result = matching_service.match_faces_sequence(ktp_frame, liveness_frames)
-            
-            else:
-                return jsonify({'error': 'Liveness image or frames required'}), 400
-            
-            return jsonify(result)
-        
-        except Exception as e:
-            print(f'[match_routes] Error: {e}')
-            return jsonify({'error': str(e)}), 500
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+class MatchRequest(BaseModel):
+    ktp_face_image: Optional[str] = None
+    ktp_image: Optional[str] = None
+    processed_ktp_image: Optional[str] = None
+    ktp_photo_crop_path: Optional[str] = None
+
+    liveness_image: Optional[str] = None
+    liveness_frames: Optional[List[str]] = None
+
+
+@router.post("/match/faces")
+def match_faces(req: MatchRequest):
+    ktp_b64 = req.ktp_face_image or req.ktp_image or req.processed_ktp_image
+    ktp_frame = matching_service.load_ktp_image(ktp_b64, req.ktp_photo_crop_path)
+    if ktp_frame is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "KTP photo crop required. Please rescan the KTP."},
+        )
+
+    if req.liveness_image:
+        liveness_frame = matching_service.decode_image(req.liveness_image)
+        if liveness_frame is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Could not decode liveness image"},
+            )
+        return matching_service.match_faces_single(ktp_frame, liveness_frame)
+
+    if req.liveness_frames:
+        liveness_frames = matching_service.decode_frames(req.liveness_frames)
+        if not liveness_frames:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Could not decode liveness frames"},
+            )
+        return matching_service.match_faces_sequence(ktp_frame, liveness_frames)
+
+    raise HTTPException(
+        status_code=400,
+        detail={"error": "liveness_image or liveness_frames required"},
+    )
+
+
+class SignatureMatchRequest(BaseModel):
+    ktp_signature_base64: str
+    user_signature_base64: str
+
+
+@router.post("/match/signature")
+def match_signature(req: SignatureMatchRequest):
+    if not req.ktp_signature_base64 or not req.user_signature_base64:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "ktp_signature_base64 and user_signature_base64 are required"},
+        )
+
+    result = matching_service.match_signatures(
+        req.ktp_signature_base64,
+        req.user_signature_base64,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result)
+    return result

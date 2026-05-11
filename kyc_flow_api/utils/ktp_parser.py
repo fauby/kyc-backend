@@ -256,10 +256,18 @@ def parse_ktp_text(text):
             result["nik"] = all_digits[:16]
     result["nik"] = normalize_nik(result["nik"], joined_text)
 
-    # Nama: handle OCR drift (e.g. "Mama")
-    result["nama"] = extract_after_label(lines, r"^(Nama|Mama)(?:\s+Lengkap)?[\s:]*", next_lines=2)
+    # Nama: handle OCR drift (e.g. "Mama", "Narna")
+    result["nama"] = extract_after_label(
+        lines,
+        r"^(Nama|Mama|Narna)(?:\s+Lengkap)?[\s:]*",
+        next_lines=2,
+    )
     if result["nama"] == "-":
-        result["nama"] = extract_after_fuzzy_labels(lines, ["nama", "mama"], next_lines=2)
+        result["nama"] = extract_after_fuzzy_labels(
+            lines,
+            ["nama", "mama", "narna"],
+            next_lines=2,
+        )
     result["nama"] = normalize_name(result["nama"])
 
     # Tempat/Tgl Lahir: parse specific place/date pair from a single noisy line.
@@ -413,10 +421,10 @@ def parse_ktp_text(text):
             result["berlaku_hingga"] = all_dates[-1]
 
     # Final line-based stabilization overrides for noisy OCR outputs.
-    # 1) Nama from explicit line (e.g. "Nama ..." or "Bg -...")
-    nama_line = find_first_line(r"^(Nama|Bg)\b")
+    # 1) Nama from explicit line (e.g. "Nama ...", "Narna ...", or "Bg -...")
+    nama_line = find_first_line(r"^(Nama|Narna|Bg)\b")
     if nama_line:
-        nama_candidate = re.sub(r"^(Nama|Bg)\b", "", nama_line, flags=re.IGNORECASE)
+        nama_candidate = re.sub(r"^(Nama|Narna|Bg)\b", "", nama_line, flags=re.IGNORECASE)
         nama_candidate = clean_value(nama_candidate).strip(".-: ")
         if nama_candidate and "JL" not in nama_candidate.upper():
             result["nama"] = normalize_name(nama_candidate)

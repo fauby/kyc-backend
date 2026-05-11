@@ -30,6 +30,7 @@ class LivenessService:
         """Initialize liveness service."""
         self.log_prefix = LOG_PREFIX_LIVENESS
         self.max_frame_side = 640
+        self._haar_face = None
 
     def _resize_for_speed(self, frame):
         """Resize large frames to speed up decode, pose, and matching."""
@@ -45,6 +46,32 @@ class LivenessService:
         nw = max(1, int(w * scale))
         nh = max(1, int(h * scale))
         return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    def _quick_has_face(self, frame):
+        """
+        Fast face presence check to short-circuit obvious failures.
+        This does not replace the dlib-based algorithm; it only avoids
+        running it when there's clearly no face at all.
+        """
+        try:
+            if frame is None or frame.size == 0:
+                return False
+            if self._haar_face is None:
+                cascade_path = os.path.join(
+                    cv2.data.haarcascades, 'haarcascade_frontalface_default.xml'
+                )
+                self._haar_face = cv2.CascadeClassifier(cascade_path)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            faces = self._haar_face.detectMultiScale(
+                gray,
+                scaleFactor=1.2,
+                minNeighbors=4,
+                minSize=(60, 60),
+            )
+            return faces is not None and len(faces) > 0
+        except Exception:
+            return True
     
     def decode_frames(self, frames_b64):
         """
@@ -146,3 +173,88 @@ class LivenessService:
                 'roll': float(roll) if roll is not None else None,
             }
         }
+
+    def extract_video_frames(self, video_path, sample_every=8, max_frames=10):
+        """
+        Extract sampled frames from a video file.
+
+        Returns list of BGR frames (np.ndarray). This keeps the liveness algorithm unchanged.
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f'{self.log_prefix} could not open video: {video_path}')
+            return []
+
+        frames = []
+        any_face_quick = False
+        idx = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if idx % int(sample_every) == 0:
+                    frame = self._resize_for_speed(frame)
+                    frames.append(frame)
+
+                    # Probe for a face early to short-circuit obvious failures.
+                    if len(frames) <= 3 and not any_face_quick:
+                        any_face_quick = self._quick_has_face(frame)
+                    if len(frames) == 3 and not any_face_quick:
+                        break
+
+                    if len(frames) >= int(max_frames):
+                        break
+                idx += 1
+        finally:
+            cap.release()
+
+        return frames
+
+    def detect_liveness_from_video(self, video_path, required_poses=None):
+        """
+        Detect liveness from an uploaded mp4 video file by sampling frames.
+        """
+        if required_poses is None:
+            required_poses = DEFAULT_REQUIRED_POSES
+
+        frames = self.extract_video_frames(video_path, sample_every=8, max_frames=10)
+        if len(frames) < 3:
+            return {'error': 'Video too short or unreadable'}
+
+        # If the early probe (first 3 sampled frames) can't find any face, stop here.
+        if not any(self._quick_has_face(frames[i]) for i in range(min(3, len(frames)))):
+            return {'error': 'No face detected in video'}
+
+        if len(frames) < 5:
+            return {'error': 'Video too short or unreadable'}
+
+        result = detect_liveness_sequence(frames, required_poses)
+
+        if float(result.get('face_coverage', 0.0)) <= 0.0:
+            return {'error': 'No face detected in video'}
+
+        best_frame, yaw, pitch, roll = get_best_liveness_frame(frames)
+        if best_frame is not None:
+            ok, buffer = cv2.imencode(
+                '.jpg', best_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 62]
+            )
+            if ok:
+                result['best_frame'] = base64.b64encode(buffer).decode('utf-8')
+                result['best_frame_head_pose'] = {
+                    'yaw': float(yaw) if yaw is not None else None,
+                    'pitch': float(pitch) if pitch is not None else None,
+                    'roll': float(roll) if roll is not None else None,
+                }
+
+        faces_count = int(round(float(result.get('face_coverage', 0.0)) * len(frames)))
+        result['diagnostics'] = {
+            'frames_total': len(frames),
+            'faces_detected': faces_count,
+            'required_poses': required_poses,
+            'downscaled_max_side': self.max_frame_side,
+            'sample_every': 8,
+            'max_frames': 10,
+        }
+
+        return result

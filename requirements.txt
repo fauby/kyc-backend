@@ -1,4 +1,6 @@
-Flask
+fastapi
+uvicorn[standard]
+python-multipart
 opencv-python
 pytesseract
 Pillow

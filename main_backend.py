@@ -1,4 +1,4 @@
-"""Direct Flask launcher for the KYC Flow API."""
+"""Single launcher for the KYC Flow API (FastAPI)."""
 
 import os
 import sys
@@ -12,4 +12,6 @@ from kyc_flow_api.app_factory import app
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    import uvicorn
+
+    uvicorn.run(app, host='0.0.0.0', port=5000, log_level='info')

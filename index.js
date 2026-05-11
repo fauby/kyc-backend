@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const multer = require("multer");
+const { execSync } = require("child_process");
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // Increase limit if needed
@@ -11,9 +12,28 @@ const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir);
 }
-const upload = multer({ dest: uploadsDir });
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB cap for mp4
+});
 
-const PROXY_BASE_URL = process.env.FLASK_URL || "http://127.0.0.1:5000";
+function getDefaultProxyBaseUrl() {
+  // In many Windows+WSL2 setups, the WSL service is NOT reachable via 127.0.0.1.
+  // Prefer the WSL VM IP when FLASK_URL is not explicitly set.
+  try {
+    if (process.platform === "win32") {
+      const ip = String(execSync("wsl hostname -I", { stdio: ["ignore", "pipe", "ignore"] }))
+        .trim()
+        .split(/\s+/)[0];
+      if (ip) return `http://${ip}:5000`;
+    }
+  } catch (_e) {
+    // ignore and fall back
+  }
+  return "http://127.0.0.1:5000";
+}
+
+const PROXY_BASE_URL = process.env.FLASK_URL || getDefaultProxyBaseUrl();
 const MAX_RETRIES = 3;
 const TIMEOUT_MS = parseInt(process.env.OCR_TIMEOUT_MS || "120000", 10);
 const MAX_BASE64_CHARS = parseInt(
@@ -45,6 +65,11 @@ async function postWithRetry(url, data, config = {}) {
       if (error.response) {
         console.error("Proxy response status:", error.response.status);
         console.error("Proxy response data:", error.response.data);
+
+        // Do not retry client errors (4xx). These are usually validation issues.
+        if (error.response.status >= 400 && error.response.status < 500) {
+          throw error;
+        }
       }
       if (attempt < MAX_RETRIES) {
         const backoffMs = 1000 * Math.pow(2, attempt);
@@ -61,7 +86,8 @@ app.get("/health", (_req, res) => {
 
 app.post("/ocr", upload.single("file"), async (req, res) => {
   try {
-    const { box, photoBox, photoWidth, photoHeight } = req.body || {};
+    const { box, photoBox, signatureBox, photoWidth, photoHeight } =
+      req.body || {};
     let rawImagePath = null;
 
     if (req.file && req.file.path) {
@@ -91,14 +117,27 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
         typeof photoBox === "string" ? photoBox : JSON.stringify(photoBox),
       );
     }
+    if (signatureBox) {
+      form.append(
+        "signatureBox",
+        typeof signatureBox === "string"
+          ? signatureBox
+          : JSON.stringify(signatureBox),
+      );
+    }
     if (photoWidth) form.append("photoWidth", String(photoWidth));
     if (photoHeight) form.append("photoHeight", String(photoHeight));
 
     const ocrResponse = await postWithRetry(OCR_URL, form, {
       headers: form.getHeaders(),
     });
-    const { processed_image, ktp_face_base64, ktp_photo_base64, ...ktpData } =
-      ocrResponse.data || {};
+    const {
+      processed_image,
+      ktp_face_base64,
+      ktp_photo_base64,
+      ktp_signature_base64,
+      ...ktpData
+    } = ocrResponse.data || {};
 
     // Store processed image (optional)
     if (processed_image) {
@@ -119,6 +158,13 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
       );
       fs.writeFileSync(photoCropPath, Buffer.from(ktp_photo_base64, "base64"));
     }
+    if (ktp_signature_base64) {
+      const sigCropPath = path.join(
+        uploadsDir,
+        `ktp_signature_crop_${Date.now()}.png`,
+      );
+      fs.writeFileSync(sigCropPath, Buffer.from(ktp_signature_base64, "base64"));
+    }
 
     // Send only bounded image payloads to avoid OOM in React Native networking bridge.
     res.json({
@@ -126,6 +172,10 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
       processed_image: maybeKeepBase64(processed_image, "processed_image"),
       ktp_face_base64: maybeKeepBase64(ktp_face_base64, "ktp_face_base64"),
       ktp_photo_base64: maybeKeepBase64(ktp_photo_base64, "ktp_photo_base64"),
+      ktp_signature_base64: maybeKeepBase64(
+        ktp_signature_base64,
+        "ktp_signature_base64",
+      ),
     });
   } catch (err) {
     console.error(err);
@@ -133,35 +183,38 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
   }
 });
 
-app.post("/liveness/detect", async (req, res) => {
-  try {
-    const url = `${PROXY_BASE_URL}/liveness/detect`;
-    const response = await postWithRetry(url, req.body, {
-      headers: { "Content-Type": "application/json" },
-    });
-    res.json(response.data);
-  } catch (err) {
-    console.error(err);
-    res.status(502).json({
-      error: "Liveness detection failed after retries",
-      details: err.message,
-    });
+app.post("/liveness", upload.single("video"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No video file provided" });
   }
-});
 
-app.post("/liveness/best-frame", async (req, res) => {
+  const filePath = req.file.path;
   try {
-    const url = `${PROXY_BASE_URL}/liveness/best-frame`;
-    const response = await postWithRetry(url, req.body, {
-      headers: { "Content-Type": "application/json" },
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("video", fs.createReadStream(filePath), {
+      filename: req.file.originalname || "liveness.mp4",
+      contentType: req.file.mimetype || "video/mp4",
+    });
+    if (req.body?.session_id) {
+      form.append("session_id", String(req.body.session_id));
+    }
+
+    const response = await postWithRetry(`${PROXY_BASE_URL}/liveness`, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
     });
     res.json(response.data);
   } catch (err) {
     console.error(err);
-    res.status(502).json({
-      error: "Best-frame lookup failed after retries",
-      details: err.message,
+    const status = err.response?.status || 502;
+    res.status(status).json({
+      error: "Liveness detection failed",
+      details: err.response?.data || err.message,
     });
+  } finally {
+    fs.unlink(filePath, () => {});
   }
 });
 
@@ -177,6 +230,23 @@ app.post("/match/faces", async (req, res) => {
     res.status(502).json({
       error: "Face matching failed after retries",
       details: err.message,
+    });
+  }
+});
+
+app.post("/match/signature", async (req, res) => {
+  try {
+    const url = `${PROXY_BASE_URL}/match/signature`;
+    const response = await postWithRetry(url, req.body, {
+      headers: { "Content-Type": "application/json" },
+    });
+    res.json(response.data);
+  } catch (err) {
+    console.error(err);
+    const status = err.response?.status || 502;
+    res.status(status).json({
+      error: "Signature matching failed",
+      details: err.response?.data || err.message,
     });
   }
 });

@@ -22,17 +22,30 @@ from ..config import (
     LOG_PREFIX_OCR,
     IMAGE_PADDING_RATIO,
     OCR_TOP_BOTTOM_TRIM_RATIO,
+    CARD_RATIO_MIN,
+    CARD_RATIO_MAX,
+    KTP_PHOTO_X_START,
+    KTP_PHOTO_Y_START,
+    KTP_PHOTO_X_END,
+    KTP_PHOTO_Y_END,
+    KTP_SIGNATURE_X_START,
+    KTP_SIGNATURE_Y_START,
+    KTP_SIGNATURE_X_END,
+    KTP_SIGNATURE_Y_END,
 )
 from ..utils import (
     load_image_correct_orientation,
     extract_ktp_card_region,
     extract_ktp_photo_region,
+    extract_ktp_signature_region,
     encode_image_to_base64,
     save_image,
     parse_ktp_text,
 )
 
 logger = logging.getLogger(__name__)
+
+OCR_SERVICE_BUILD = "2026-05-10-signature-fe-box-v3"
 
 
 class OCRService:
@@ -42,8 +55,22 @@ class OCRService:
         """Initialize OCR service."""
         self.upload_dir = UPLOAD_DIR
         self.log_prefix = LOG_PREFIX_OCR
+        print(f"{self.log_prefix} OCRService build={OCR_SERVICE_BUILD}")
+
+    def _is_card_like(self, img) -> bool:
+        """Heuristic: treat an image as a KTP card if its aspect ratio matches KTP layout."""
+        try:
+            if img is None or img.size == 0:
+                return False
+            h, w = img.shape[:2]
+            if h <= 0 or w <= 0:
+                return False
+            ratio = (w / h) if h else 0.0
+            return CARD_RATIO_MIN <= ratio <= CARD_RATIO_MAX
+        except Exception:
+            return False
     
-    def process_ktp_image(self, file, box=None, photo_box=None):
+    def process_ktp_image(self, file, box=None, photo_box=None, signature_box=None):
         """
         Process uploaded KTP image and extract data.
         
@@ -51,6 +78,7 @@ class OCRService:
             file: File object from Flask request
             box: Optional bounding box dict with x, y, w, h (normalized 0-1)
             photo_box: Optional red-box photo crop from FE with x, y, w, h (normalized 0-1)
+            signature_box: Optional signature crop from FE with x, y, w, h (normalized 0-1)
             
         Returns:
             Dictionary with OCR results and image paths
@@ -75,11 +103,13 @@ class OCRService:
             
             # Refine card region
             refined = extract_ktp_card_region(cropped)
+            refined_for_signature = refined.copy() if refined is not None else None
 
             # Extract KTP photo region
             photo_path = None
             ktp_photo = None
             print(f'{self.log_prefix} photo_box received: {photo_box is not None}')
+            print(f'{self.log_prefix} signature_box received: {signature_box is not None}')
             try:
                 # Prefer explicit FE red-box crop for KTP person photo.
                 ktp_photo = self._apply_photo_crop_box(img, photo_box, w, h)
@@ -103,6 +133,38 @@ class OCRService:
             except Exception as e:
                 print(f'{self.log_prefix} photo crop failed: {e}', exc_info=True)
 
+            # Extract signature region — same 3-tier system as ktp_photo_crop:
+            # 1. signatureBox from FE (direct coords, identical to photoBox)
+            # 2. Derived from photoBox using KTP layout math
+            # 3. Fixed coords on warped card (fallback)
+            signature_path = None
+            ktp_signature_crop = None
+            try:
+                ktp_signature_crop = self._apply_signature_crop_box(img, signature_box, w, h)
+                if ktp_signature_crop is not None:
+                    print(f'{self.log_prefix} signature crop from signatureBox OK, shape={ktp_signature_crop.shape}')
+                else:
+                    print(f'{self.log_prefix} signatureBox not provided, deriving from photoBox...')
+                    ktp_signature_crop = self._apply_signature_crop_from_photo_box(img, photo_box, w, h)
+                    if ktp_signature_crop is not None:
+                        print(f'{self.log_prefix} signature crop derived from photoBox OK, shape={ktp_signature_crop.shape}')
+                    else:
+                        print(f'{self.log_prefix} photoBox derive failed, trying warped card fallback...')
+                        ktp_signature_crop = extract_ktp_signature_region(refined_for_signature)
+                        if ktp_signature_crop is not None:
+                            print(f'{self.log_prefix} signature crop from warped card OK, shape={ktp_signature_crop.shape}')
+
+                if ktp_signature_crop is not None:
+                    signature_path = os.path.join(
+                        self.upload_dir, f'ktp_signature_crop_{request_id}.png'
+                    )
+                    save_image(ktp_signature_crop, signature_path)
+                    print(f'{self.log_prefix} ktp signature saved to {signature_path}')
+                else:
+                    print(f'{self.log_prefix} WARNING: signature crop returned None from all attempts')
+            except Exception as e:
+                print(f'{self.log_prefix} signature crop failed: {e}', exc_info=True)
+
             # Optional vertical trim to remove noisy margins above/below card text area
             refined = self._apply_top_bottom_trim(refined)
 
@@ -120,7 +182,15 @@ class OCRService:
             
             # Prepare response
             response = self._prepare_response(
-                refined, refined_path, photo_path, ktp_data, ktp_photo
+                refined,
+                refined_path,
+                photo_path,
+                ktp_data,
+                ktp_photo,
+                refined_for_signature,
+                request_id,
+                ktp_signature_crop,
+                signature_path,
             )
             
             return response
@@ -200,6 +270,94 @@ class OCRService:
             print(f'{self.log_prefix} photoBox crop parse failed: {e}')
             return None
 
+    def _apply_signature_crop_box(self, img, signature_box, w, h):
+        """Crop KTP signature from full frame using explicit signatureBox coords (mirrors _apply_photo_crop_box)."""
+        if not signature_box:
+            return None
+
+        try:
+            x = max(0, int(signature_box.get('x', 0) * w))
+            y = max(0, int(signature_box.get('y', 0) * h))
+            cw = max(1, int(signature_box.get('w', 0) * w))
+            ch = max(1, int(signature_box.get('h', 0) * h))
+
+            if cw <= 1 or ch <= 1:
+                return None
+
+            x2 = min(w, x + cw)
+            y2 = min(h, y + ch)
+            if x >= x2 or y >= y2:
+                return None
+
+            print(
+                f'{self.log_prefix} signatureBox crop from FE: '
+                f'x={x}, y={y}, w={x2 - x}, h={y2 - y}'
+            )
+            crop = img[y:y2, x:x2]
+            if crop is None or crop.size == 0:
+                return None
+            return crop
+        except Exception as e:
+            print(f'{self.log_prefix} signatureBox crop parse failed: {e}')
+            return None
+
+    def _apply_signature_crop_from_photo_box(self, img, photo_box, w, h):
+        """
+        Derive the signature position in the full frame from photo_box,
+        then crop — identical logic to _apply_photo_crop_box but for the signature area.
+
+        Since we know where the KTP photo sits inside the card (KTP_PHOTO_* ratios),
+        we can compute where the signature sits in the full frame.
+        """
+        if not photo_box:
+            return None
+
+        try:
+            # Photo pixel coords in the full frame
+            px = photo_box.get('x', 0) * w
+            py = photo_box.get('y', 0) * h
+            pw = photo_box.get('w', 0) * w
+            ph = photo_box.get('h', 0) * h
+
+            if pw <= 1 or ph <= 1:
+                return None
+
+            # Estimate card pixel size from photo size + known KTP layout ratios
+            photo_ratio_w = float(KTP_PHOTO_X_END) - float(KTP_PHOTO_X_START)
+            photo_ratio_h = float(KTP_PHOTO_Y_END) - float(KTP_PHOTO_Y_START)
+            card_w = pw / photo_ratio_w
+            card_h = ph / photo_ratio_h
+
+            # Card top-left corner in the full frame
+            card_x = px - float(KTP_PHOTO_X_START) * card_w
+            card_y = py - float(KTP_PHOTO_Y_START) * card_h
+
+            # Signature corners in the full frame
+            sig_x1 = int(card_x + float(KTP_SIGNATURE_X_START) * card_w)
+            sig_y1 = int(card_y + float(KTP_SIGNATURE_Y_START) * card_h)
+            sig_x2 = int(card_x + float(KTP_SIGNATURE_X_END)   * card_w)
+            sig_y2 = int(card_y + float(KTP_SIGNATURE_Y_END)   * card_h)
+
+            sig_x1 = max(0, min(w - 1, sig_x1))
+            sig_y1 = max(0, min(h - 1, sig_y1))
+            sig_x2 = max(sig_x1 + 1, min(w, sig_x2))
+            sig_y2 = max(sig_y1 + 1, min(h, sig_y2))
+
+            if (sig_x2 - sig_x1) <= 1 or (sig_y2 - sig_y1) <= 1:
+                return None
+
+            print(
+                f'{self.log_prefix} signatureBox derived from photoBox: '
+                f'x={sig_x1}, y={sig_y1}, w={sig_x2 - sig_x1}, h={sig_y2 - sig_y1}'
+            )
+            crop = img[sig_y1:sig_y2, sig_x1:sig_x2]
+            if crop is None or crop.size == 0:
+                return None
+            return crop
+        except Exception as e:
+            print(f'{self.log_prefix} signature crop from photoBox failed: {e}')
+            return None
+
     def _apply_top_bottom_trim(self, img):
         """Trim top and bottom margins by configured ratio."""
         if img is None or img.size == 0:
@@ -225,7 +383,18 @@ class OCRService:
         )
         return trimmed
     
-    def _prepare_response(self, refined, refined_path, photo_path, ktp_data, ktp_photo):
+    def _prepare_response(
+        self,
+        refined,
+        refined_path,
+        photo_path,
+        ktp_data,
+        ktp_photo,
+        refined_for_signature=None,
+        request_id=None,
+        ktp_signature_crop=None,
+        ktp_signature_crop_path=None,
+    ):
         """Prepare OCR response with encoded images."""
         print(f'{self.log_prefix} _prepare_response: ktp_photo is not None: {ktp_photo is not None}')
         if ktp_photo is not None:
@@ -299,6 +468,38 @@ class OCRService:
             print(f'{self.log_prefix} extracted KTP face, size={ktp_face.shape[1]}x{ktp_face.shape[0]}')
         else:
             print(f'{self.log_prefix} could not extract face from KTP')
+
+        # Extract signature crop for signature matching step.
+        # Prefer a precomputed crop (signatureBox or fallback) from process_ktp_image.
+        ktp_signature_base64 = None
+        ktp_signature_crop_path_out = ktp_signature_crop_path
+        try:
+            sig_crop = ktp_signature_crop
+
+            if sig_crop is not None:
+                sh, sw = sig_crop.shape[:2]
+                max_side = max(sh, sw)
+                if max_side > 700:
+                    scale = 700.0 / max_side
+                    nw = max(1, int(sw * scale))
+                    nh = max(1, int(sh * scale))
+                    sig_crop = cv2.resize(sig_crop, (nw, nh), interpolation=cv2.INTER_AREA)
+
+                ok2, sig_buf = cv2.imencode('.png', sig_crop)
+                if ok2:
+                    ktp_signature_base64 = base64.b64encode(sig_buf).decode('utf-8')
+                    if ktp_signature_crop_path_out is None:
+                        try:
+                            suffix = request_id or str(int(uuid.uuid4().int % 10**12))
+                            ktp_signature_crop_path_out = os.path.join(
+                                self.upload_dir,
+                                f'ktp_signature_crop_{suffix}.png',
+                            )
+                            save_image(sig_crop, ktp_signature_crop_path_out)
+                        except Exception:
+                            ktp_signature_crop_path_out = None
+        except Exception as e:
+            print(f'{self.log_prefix} signature crop failed: {e}')
         
         print(f'{self.log_prefix} FINAL RESPONSE: ktp_photo_base64 is not None: {ktp_photo_base64 is not None}')
         if ktp_photo_base64:
@@ -311,7 +512,9 @@ class OCRService:
             'processed_image': processed_image_b64,
             'ktp_face_base64': ktp_face_base64,
             'ktp_photo_base64': ktp_photo_base64,
+            'ktp_signature_base64': ktp_signature_base64,
             'ktp_crop_path': None,  # Paths are server-side only
             'ktp_refined_path': refined_path,
             'ktp_photo_crop_path': photo_path,
+            'ktp_signature_crop_path': ktp_signature_crop_path_out,
         }

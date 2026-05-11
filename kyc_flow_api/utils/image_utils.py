@@ -7,7 +7,9 @@ from ..config import (
     CANNY_THRESHOLD_LOW, CANNY_THRESHOLD_HIGH,
     CARD_EXPANSION_RATIO, MIN_DIMENSION, CARD_RATIO_MIN, CARD_RATIO_MAX,
     MIN_CONTOUR_AREA_RATIO, KTP_PHOTO_X_START, KTP_PHOTO_Y_START,
-    KTP_PHOTO_X_END, KTP_PHOTO_Y_END
+    KTP_PHOTO_X_END, KTP_PHOTO_Y_END,
+    KTP_SIGNATURE_X_START, KTP_SIGNATURE_Y_START,
+    KTP_SIGNATURE_X_END, KTP_SIGNATURE_Y_END,
 )
 
 
@@ -182,6 +184,31 @@ def extract_ktp_photo_region(card_image):
     if photo.size == 0:
         return None
     return photo
+
+
+def extract_ktp_signature_region(card_image):
+    """
+    Crop the KTP signature area from a warped KTP card using fixed relative bounds.
+    Mirrors extract_ktp_photo_region — adjust KTP_SIGNATURE_* in config.py to reposition.
+    """
+    h, w = card_image.shape[:2]
+    if h < MIN_DIMENSION or w < MIN_DIMENSION:
+        return None
+
+    x1 = int(w * KTP_SIGNATURE_X_START)
+    y1 = int(h * KTP_SIGNATURE_Y_START)
+    x2 = int(w * KTP_SIGNATURE_X_END)
+    y2 = int(h * KTP_SIGNATURE_Y_END)
+
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(x1 + 1, min(w, x2))
+    y2 = max(y1 + 1, min(h, y2))
+
+    sig = card_image[y1:y2, x1:x2]
+    if sig.size == 0:
+        return None
+    return sig
 
 
 def encode_image_to_base64(image, format='jpg'):

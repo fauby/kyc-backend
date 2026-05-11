@@ -1,17 +1,10 @@
 """Routes package for KYC Flow API."""
 
-from .ocr_routes import register_ocr_routes
-from .liveness_routes import register_liveness_routes
+from .ocr_routes import router as ocr_router
+from .liveness_routes import router as liveness_router
 
 
 def register_all_routes(app):
-    """Register all routes to Flask app."""
-    register_ocr_routes(app)
-    register_liveness_routes(app)
-
-
-__all__ = [
-    'register_all_routes',
-    'register_ocr_routes',
-    'register_liveness_routes',
-]
+    """Register all routes to FastAPI app."""
+    app.include_router(ocr_router)
+    app.include_router(liveness_router)
